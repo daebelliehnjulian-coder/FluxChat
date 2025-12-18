@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>FluxChat</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap');
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:Segoe UI,system-ui;background:#1e1e1e;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+    :root{--accent:#e53935;--accent-dark:#c62828}
+    button{cursor:pointer;border:none;border-radius:6px;padding:10px 18px;background:var(--accent);color:#fff;transition:.2s}
+    button:hover{background:var(--accent-dark)}
+    .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:10}
+    .modal-content{background:#2a2a2a;padding:30px 40px;border-radius:12px;text-align:center;min-width:340px}
+    .modal h2{margin-bottom:20px;font-weight:300}
+    #fluxLogo{font-family:'Bebas Neue',cursive;font-size:4rem;letter-spacing:3px;color:var(--accent);text-shadow:0 0 10px var(--accent),0 0 20px #ff000077;margin-bottom:15px}
+    input{padding:10px 12px;border:none;border-radius:6px;width:100%;margin:6px 0;background:rgba(255,255,255,.1);color:#fff;outline:none}
+    .room-buttons{display:flex;gap:12px;justify-content:center;margin-top:12px}
+    .chat-container{flex:1;display:flex;flex-direction:column;height:100vh}
+    .chat-header{background:#252525;padding:14px 18px;display:flex;justify-content:space-between;align-items:center}
+    .messages-container{flex:1;padding:18px;overflow-y:auto;background:#1a1a1a}
+    .message{margin-bottom:10px;padding:8px 12px;border-radius:8px;max-width:70%;background:rgba(255,255,255,.05)}
+    .message.own{margin-left:auto;background:var(--accent-dark)}
+    .input-container{display:flex;padding:12px;background:#252525}
+    .message-input{flex:1;border-radius:20px;padding:10px 14px;margin-right:10px}
+    .send-btn{border-radius:20px;min-width:70px;background:var(--accent)}
+    .hidden{display:none}
+    #serverBanner{margin-top:12px;font-size:.9rem;color:#aaa}
+  </style>
+</head>
+<body>
+
+<!-- NAME MODAL -->
+<div id="nameModal" class="modal">
+  <div class="modal-content">
+    <div id="fluxLogo">FLUX</div>
+    <input id="nameInput" placeholder="Your name" maxlength="20">
+    <button onclick="setName()">Continue</button>
+  </div>
+</div>
+
+<!-- ROOM MODAL -->
+<div id="roomModal" class="modal hidden">
+  <div class="modal-content">
+    <h2>Pick a room</h2>
+    <div class="room-buttons">
+      <button onclick="joinPublic()">Public Room</button>
+      <button onclick="createPrivate()">Create Private</button>
+    </div>
+    <div style="margin-top:20px;border-top:1px solid #444;padding-top:15px">
+      <input id="joinCode" placeholder="Room code" maxlength="6" style="width:120px;text-transform:uppercase">
+      <button onclick="joinPrivate()">Join Private</button>
+    </div>
+    <div id="serverBanner"></div>
+  </div>
+</div>
+
+<!-- CHAT -->
+<div id="chatContainer" class="chat-container hidden">
+  <div class="chat-header">
+    <span id="roomInfo"></span>
+    <button onclick="leave()">Leave</button>
+  </div>
+  <div id="msgs" class="messages-container"></div>
+  <div class="input-container">
+    <input id="msgInput" class="message-input" placeholder="Type..." maxlength="500">
+    <button class="send-btn" onclick="sendMsg()">Send</button>
+  </div>
+</div>
+
+<!-- PubNub SDK -->
+<script src="https://unpkg.com/pubnub@7/dist/web/pubnub.min.js"></script>
+<script>
+/* ---------- your keys ---------- */
+const SUB = 'sub-c-93adc65a-cd72-4b68-8049-df11a79955a1';
+const PUB = 'pub-c-567373f5-7881-43df-9846-11e2c71e63b9';
+
+/* ---------- state ---------- */
+let username, channel, pubnub;
+
+/* ---------- inline localhost server ---------- */
+function startServer() {
+  // create a tiny HTTP server with ES-module syntax
+  const code = `
+import http from 'http';
+import { readFile } from 'fs/promises';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const server = http.createServer(async (req, res) => {
+  const file = join(__dirname, req.url === '/' ? 'index.html' : req.url.slice(1));
+  try { const content = await readFile(file); res.writeHead(200, {'Content-Type': 'text/html'}); res.end(content); }
+  catch { res.writeHead(404); res.end('Not found'); }
+});
+server.listen(8000, () => console.log('▶ http://localhost:8000'));
+`;
+  const blob = new Blob([code], { type: 'application/javascript' });
+  const worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+  worker.onerror = e => console.error('Server error', e);
+  qs('#serverBanner').textContent = 'Server starting… open http://localhost:8000';
+}
+
+/* ---------- name / room flow ---------- */
+function setName(){
+  username = qs('#nameInput').value.trim();
+  if(!username) return alert('Name required');
+  qs('#nameModal').classList.add('hidden');
+  qs('#roomModal').classList.remove('hidden');
+  startServer(); // fire up localhost automatically
+}
+function joinPublic(){
+  channel = 'public-' + Math.floor(Math.random()*10000);
+  startChat();
+}
+function createPrivate(){
+  channel = 'private-' + randCode();
+  startChat();
+}
+function joinPrivate(){
+  const code = qs('#joinCode').value.trim().toUpperCase();
+  if(code.length!==6) return alert('6-char code needed');
+  channel = 'private-' + code;
+  startChat();
+}
+function leave(){
+  if(pubnub) pubnub.unsubscribeAll();
+  qs('#chatContainer').classList.add('hidden');
+  qs('#roomModal').classList.remove('hidden');
+  qs('#msgs').innerHTML='';
+}
+
+/* ---------- real-time chat WITH STATUS ---------- */
+function startChat(){
+  qs('#roomModal').classList.add('hidden');
+  qs('#chatContainer').classList.remove('hidden');
+  qs('#roomInfo').textContent = (channel.startsWith('public')?'Public':'Private')+' • '+channel.split('-').pop();
+
+  pubnub = new PubNub({
+    subscribeKey: SUB,
+    publishKey: PUB,
+    uuid: username,
+    ssl: true,
+    restore: true,
+    autoNetworkDetection: true
+  });
+
+  pubnub.addListener({
+    status: (st) => {
+      console.log('PubNub status:', st.category, st.errorData);
+      switch(st.category){
+        case 'PNConnectedCategory':
+          systemMsg('🟢 connected to '+channel);
+          break;
+        case 'PNNetworkDownCategory':
+        case 'PNNetworkIssuesCategory':
+          systemMsg('🔴 network/problem – check console');
+          break;
+        case 'PNAccessDeniedCategory':
+          systemMsg('🔴 wrong/denied key');
+          break;
+        case 'PNTimeoutCategory':
+          systemMsg('🔴 timeout – firewall/proxy?');
+          break;
+      }
+    },
+    message: e => renderMsg(e.message.user, e.message.text, e.message.user===username)
+  });
+
+  pubnub.subscribe({channels: [channel]});
+  systemMsg(username + ' joining…');
+  qs('#msgInput').focus();
+}
+function sendMsg(){
+  const text = qs('#msgInput').value.trim();
+  if(!text) return;
+  pubnub.publish({channel, message:{user:username, text}});
+  qs('#msgInput').value='';
+}
+
+/* ---------- helpers ---------- */
+function renderMsg(user,text,self){
+  const d = document.createElement('div');
+  d.className = 'message' + (self?' own':'');
+  d.innerHTML = `<b>${user}</b> ${new Date().toLocaleTimeString([],{h:'2-digit',m:'2-digit'})}<br>${text}`;
+  qs('#msgs').appendChild(d); d.scrollIntoView();
+}
+function systemMsg(txt){ renderMsg('🟢 system',txt,false); }
+function randCode(){
+  let c=''; for(let i=0;i<6;i++) c+='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*36)];
+  return c;
+}
+function qs(s){return document.querySelector(s)}
+
+/* enter keys */
+qs('#nameInput').addEventListener('keydown',e=>{if(e.key==='Enter')setName()});
+qs('#msgInput').addEventListener('keydown',e=>{if(e.key==='Enter')sendMsg()});
+</script>
+</body>
+</html>
